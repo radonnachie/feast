@@ -14,6 +14,7 @@
 import itertools
 import os
 from datetime import datetime
+import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import oracledb
@@ -60,9 +61,18 @@ class OracleDBOnlineStoreConfig(FeastConfigBaseModel):
 
     alter_table_option: Optional[str] = None
     """ If provided, defines the ALTER TABLE that will be executed on each table created """
+    
+    write_batch_statement_size: Optional[int] = 50
+    """ Specifies the number of records that are inserted in a single statement of the write batch procedure """
+    
+    write_batch_size: Optional[int] = 100
+    """ Specifies how many statements to submit at a time for the write batch procedure """
+    
+    connection_pool_max_size: Optional[int] = 1
+    """ Specifies the upper limit of the connection pool """
 
-    write_batch_execute_size: Optional[int] = 100
-    """ Specifies the size of individual executemany calls for the write batch procedure """
+    connection_pool_increment_size: Optional[int] = 1
+    """ Specifies the increment size of the connection pool """
 
 
 class OracleDBOnlineStore(OnlineStore):
@@ -73,21 +83,28 @@ class OracleDBOnlineStore(OnlineStore):
         _conn: Oracle DB connection.
     """
 
-    _conn: Optional[oracledb.Connection] = None
+    _connpool: Optional[oracledb.ConnectionPool] = None
 
+    def __del__(self):
+        if self._connpool:
+            self._connpool.close(force=True)
+    
     def _get_conn(self, config: RepoConfig):
-        if not self._conn:
-            self._conn = _get_connection(
-                username=config.online_store.username,
+        if not self._connpool:
+            self._connpool = oracledb.create_pool(
+                user=config.online_store.username,
                 password=config.online_store.password,
                 dsn=config.online_store.dsn,
-                config_dir=config.online_store.config_dir
+                config_dir=config.online_store.config_dir,
+                min=1,
+                max=config.online_store.connection_pool_max_size,
+                increment=config.online_store.connection_pool_increment_size
             )
-        return self._conn
+        return self._connpool.acquire()
 
     @staticmethod
     def _batch_feature_views(config, data):
-        batch_size = config.online_store.write_batch_execute_size
+        batch_size = config.online_store.write_batch_statement_size
 
         value_map = [None] * batch_size
         data_generator = iter(data)
@@ -172,23 +189,23 @@ class OracleDBOnlineStore(OnlineStore):
             merge_statement = None
             batches = None
             for batch_size, batch_feature_value_map in self._batch_feature_views(config, data):
-                if batch_size != size_of_batches:
+                if batch_size == size_of_batches or len(batches) < config.online_store.write_batch_size:
+                    batches.append(batch_feature_value_map)
+                else:
                     if batches is not None:
                         # push batches
                         cursor.executemany(
                             merge_statement,
                             batches
                         )
-
-                    size_of_batches = batch_size
-                    merge_statement = self._generate_merge_statement(
-                        _table_id(project, table),
-                        feature_names,
-                        batch_size
-                    )
+                    if batch_size != size_of_batches:
+                        size_of_batches = batch_size
+                        merge_statement = self._generate_merge_statement(
+                            _table_id(project, table),
+                            feature_names,
+                            batch_size
+                        )
                     batches = [batch_feature_value_map]
-                else:
-                    batches.append(batch_feature_value_map)
 
                 if progress:
                     progress(batch_size)
@@ -200,6 +217,7 @@ class OracleDBOnlineStore(OnlineStore):
                     batches
                 )
             conn.commit()
+        conn.close()
 
     @log_exceptions_and_usage(online_store="oracledb")
     def online_read(
@@ -227,45 +245,49 @@ class OracleDBOnlineStore(OnlineStore):
             for splits in range((len(entity_keys)+49)//50)
         ]
         where_clause_terms = ') or entity_key in ('.join(where_clause_splits)
-
+        
+        entity_key_bins = [
+            serialize_entity_key(
+                entity_key,
+                entity_key_serialization_version=config.entity_key_serialization_version,
+            )
+            for entity_key in entity_keys
+        ]
         with tracing_span(name="remote_call"):
             # Fetch all entities in one go
             with conn.cursor() as cursor:
+                cursor.arraysize = len(entity_keys)
+                if requested_features is not None:
+                    cursor.arraysize *= len(requested_features)
+                cursor.prefetchrows = cursor.arraysize + 1
+
                 cursor.execute(
                     f"SELECT entity_key, feature_name, value, event_ts "
                     f"FROM {_table_id(config.project, table)} "
-                    f"WHERE entity_key IN ({where_clause_terms})"
-                    f"ORDER BY entity_key",
-                    [
-                        serialize_entity_key(
-                            entity_key,
-                            entity_key_serialization_version=config.entity_key_serialization_version,
-                        )
-                        for entity_key in entity_keys
-                    ],
+                    f"WHERE entity_key IN ({where_clause_terms})",
+                    entity_key_bins
                 )
                 rows = cursor.fetchall()
 
         rows = {
             k: list(group) for k, group in itertools.groupby(rows, key=lambda r: r[0])
         }
-        for entity_key in entity_keys:
-            entity_key_bin = serialize_entity_key(
-                entity_key,
-                entity_key_serialization_version=config.entity_key_serialization_version,
-            )
-            res = {}
+        for entity_key_bin in entity_key_bins:
+            if entity_key_bin not in rows:
+                result.append((None, None))
+                continue
+            
             res_ts = None
-            for _, feature_name, val_bin, ts in rows.get(entity_key_bin, []):
+            res = {}
+            for _, feature_name, val_bin, ts in rows[entity_key_bin]:
                 val = ValueProto()
                 val.ParseFromString(val_bin)
                 res[feature_name] = val
                 res_ts = ts
 
-            if not res:
-                result.append((None, None))
-            else:
-                result.append((res_ts, res))
+            result.append((res_ts, res))
+
+        conn.close()
         return result
 
     @log_exceptions_and_usage(online_store="oracledb")
@@ -335,6 +357,7 @@ class OracleDBOnlineStore(OnlineStore):
                         _table_id(project, table),
                     )
                 )
+        conn.close()
 
     def teardown(
         self,
@@ -351,22 +374,5 @@ class OracleDBOnlineStore(OnlineStore):
             partial=False
         )
 
-
 def _table_id(project: str, table: FeatureView) -> str:
     return f"{project}_{table.name}"
-
-
-def _get_connection(
-    username: str,
-    password: str,
-    dsn: str,
-    config_dir: str = None
-):
-    if config_dir is None:
-        config_dir = oracledb.defaults.config_dir
-    return oracledb.connect(
-        user=username,
-        password=password,
-        dsn=dsn,
-        config_dir=config_dir
-    )
