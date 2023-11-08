@@ -169,55 +169,54 @@ class OracleDBOnlineStore(OnlineStore):
         progress: Optional[Callable[[int], Any]],
     ) -> None:
 
-        conn = self._get_conn(config)
-
-        project = config.project
-
         if len(data) == 0:
             return
 
-        with conn.cursor() as cursor:
-            # each entry has a composite key of (entity_key, feature_name)
-            # and the number of feature-names is the same for entity for this FeatureView.
-            # So make each `merge into` statement select all the feature-names for each entity,
-            # and `executemany` over all the entities
 
-            # peak the first entity's features to ascertain the feature-names that will be repeated
-            feature_names = data[0][1].keys()
+        project = config.project
+        with self._get_conn(config) as conn:
+            with conn.cursor() as cursor:
+                # each entry has a composite key of (entity_key, feature_name)
+                # and the number of feature-names is the same for entity for this FeatureView.
+                # So make each `merge into` statement select all the feature-names for each entity,
+                # and `executemany` over all the entities
 
-            size_of_batches = 0
-            merge_statement = None
-            batches = None
-            for batch_size, batch_feature_value_map in self._batch_feature_views(config, data):
-                if batch_size == size_of_batches or len(batches) < config.online_store.write_batch_size:
-                    batches.append(batch_feature_value_map)
-                else:
-                    if batches is not None:
-                        # push batches
-                        cursor.executemany(
-                            merge_statement,
-                            batches
-                        )
-                    if batch_size != size_of_batches:
-                        size_of_batches = batch_size
-                        merge_statement = self._generate_merge_statement(
-                            _table_id(project, table),
-                            feature_names,
-                            batch_size
-                        )
-                    batches = [batch_feature_value_map]
+                # peak the first entity's features to ascertain the feature-names that will be repeated
+                feature_names = data[0][1].keys()
 
-                if progress:
-                    progress(batch_size)
+                size_of_batches = 0
+                merge_statement = None
+                batches = None
+                for batch_size, batch_feature_value_map in self._batch_feature_views(config, data):
+                    if batch_size == size_of_batches or len(batches) < config.online_store.write_batch_size:
+                        batches.append(batch_feature_value_map)
+                    else:
+                        if batches is not None:
+                            # push batches
+                            cursor.executemany(
+                                merge_statement,
+                                batches
+                            )
+                        if batch_size != size_of_batches:
+                            size_of_batches = batch_size
+                            merge_statement = self._generate_merge_statement(
+                                _table_id(project, table),
+                                feature_names,
+                                batch_size
+                            )
+                        batches = [batch_feature_value_map]
 
-            if batches is not None:
-                # push batches
-                cursor.executemany(
-                    merge_statement,
-                    batches
-                )
-            conn.commit()
-        conn.close()
+                    if progress:
+                        progress(batch_size)
+
+                if batches is not None:
+                    # push batches
+                    cursor.executemany(
+                        merge_statement,
+                        batches
+                    )
+                    batches = None
+                conn.commit()
 
     @log_exceptions_and_usage(online_store="oracledb")
     def online_read(
@@ -227,8 +226,6 @@ class OracleDBOnlineStore(OnlineStore):
         entity_keys: List[EntityKeyProto],
         requested_features: Optional[List[str]] = None,
     ) -> List[Tuple[Optional[datetime], Optional[Dict[str, ValueProto]]]]:
-        conn = self._get_conn(config)
-
         result: List[Tuple[
             Optional[datetime],
             Optional[Dict[str, ValueProto]]
@@ -255,22 +252,24 @@ class OracleDBOnlineStore(OnlineStore):
         ]
         with tracing_span(name="remote_call"):
             # Fetch all entities in one go
-            with conn.cursor() as cursor:
-                cursor.arraysize = len(entity_keys)
-                if requested_features is not None:
-                    cursor.arraysize *= len(requested_features)
-                cursor.prefetchrows = cursor.arraysize + 1
+            with self._get_conn(config) as conn:
+                with conn.cursor() as cursor:
+                    cursor.arraysize = len(entity_keys)
+                    if requested_features is not None:
+                        cursor.arraysize *= len(requested_features)
+                    cursor.prefetchrows = cursor.arraysize + 1
 
-                cursor.execute(
-                    f"SELECT entity_key, feature_name, value, event_ts "
-                    f"FROM {_table_id(config.project, table)} "
-                    f"WHERE entity_key IN ({where_clause_terms})",
-                    entity_key_bins
-                )
-                rows = cursor.fetchall()
+                    cursor.execute(
+                        f"SELECT entity_key, feature_name, value, event_ts "
+                        f"FROM {_table_id(config.project, table)} "
+                        f"WHERE entity_key IN ({where_clause_terms})",
+                        entity_key_bins
+                    )
+                    rows = cursor.fetchall()
 
         rows = {
-            k: list(group) for k, group in itertools.groupby(rows, key=lambda r: r[0])
+            k: list(group)
+            for k, group in itertools.groupby(rows, key=lambda r: r[0])
         }
         for entity_key_bin in entity_key_bins:
             if entity_key_bin not in rows:
@@ -287,7 +286,6 @@ class OracleDBOnlineStore(OnlineStore):
 
             result.append((res_ts, res))
 
-        conn.close()
         return result
 
     @log_exceptions_and_usage(online_store="oracledb")
@@ -300,7 +298,6 @@ class OracleDBOnlineStore(OnlineStore):
         entities_to_keep: Sequence[Entity],
         partial: bool,
     ):
-        conn = self._get_conn(config)
         project = config.project
 
         table_creation_query_lines = [
@@ -322,15 +319,6 @@ class OracleDBOnlineStore(OnlineStore):
                 f"        EXECUTE IMMEDIATE 'ALTER TABLE {config.online_store.username}.:table_id {config.online_store.alter_table_option}';",
             )
         table_creation_query = "\n".join(table_creation_query_lines)
-
-        with conn.cursor() as cursor:
-            for table in tables_to_keep:
-                cursor.execute(
-                    table_creation_query.replace(
-                        ":table_id",
-                        _table_id(project, table),
-                    )
-                )
         table_deletion_query = """
         DECLARE
             table_not_exists EXCEPTION;
@@ -349,15 +337,23 @@ class OracleDBOnlineStore(OnlineStore):
                 RAISE;
         END;
         """
-        with conn.cursor() as cursor:
-            for table in tables_to_delete:
-                cursor.execute(
-                    table_deletion_query.replace(
-                        ":table_id",
-                        _table_id(project, table),
+
+        with self._get_conn(config) as conn:
+            with conn.cursor() as cursor:
+                for table in tables_to_keep:
+                    cursor.execute(
+                        table_creation_query.replace(
+                            ":table_id",
+                            _table_id(project, table),
+                        )
                     )
-                )
-        conn.close()
+                for table in tables_to_delete:
+                    cursor.execute(
+                        table_deletion_query.replace(
+                            ":table_id",
+                            _table_id(project, table),
+                        )
+                    )
 
     def teardown(
         self,
