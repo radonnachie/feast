@@ -188,7 +188,11 @@ class OracleDBOnlineStore(OnlineStore):
                 merge_statement = None
                 batches = None
                 for batch_size, batch_feature_value_map in self._batch_feature_views(config, data):
-                    if batch_size == size_of_batches or len(batches) < config.online_store.write_batch_size:
+                    if (
+                        batches is not None
+                        and batch_size == size_of_batches
+                        and len(batches) < config.online_store.write_batch_size
+                    ):
                         batches.append(batch_feature_value_map)
                     else:
                         if batches is not None:
