@@ -307,7 +307,7 @@ class OracleDBOnlineStore(OnlineStore):
         table_creation_query_lines = [
             "BEGIN",
             "    BEGIN",
-            "        EXECUTE IMMEDIATE 'CREATE TABLE :table_id (entity_key RAW(2000), feature_name VARCHAR2(255), value BLOB, event_ts timestamp, created_ts timestamp, primary key(entity_key, feature_name))';",
+            "        EXECUTE IMMEDIATE 'CREATE TABLE :table_id (entity_key VARCHAR2(255), feature_name VARCHAR2(255), value BLOB, event_ts timestamp, created_ts timestamp, primary key(entity_key, feature_name))';",
             "        EXECUTE IMMEDIATE 'CREATE INDEX :table_id_ek ON :table_id (entity_key)';",
             "    EXCEPTION",
             "        WHEN OTHERS THEN",
