@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from couchbase.auth import PasswordAuthenticator
 from couchbase.cluster import Cluster
 # needed for options -- cluster, timeout, SQL++ (N1QL) query, etc.
-from couchbase.options import ClusterOptions
+from couchbase.options import ClusterOptions, QueryOptions
 from couchbase.management.collections import CollectionSpec
 from couchbase.management.logic.buckets_logic import CreateBucketSettings, BucketType, EvictionPolicyType, CompressionMode, EjectionMethod, StorageBackend, ConflictResolutionType
 import couchbase.subdocument as SD
@@ -54,6 +54,8 @@ class CouchbaseOnlineStore(OnlineStore):
     The interface that Feast uses to interact with the storage system that handles online features.
     """
 
+    _cluster: Cluster = None
+
     @staticmethod
     def _get_db_path(config: RepoConfig) -> str:
         assert (
@@ -67,38 +69,50 @@ class CouchbaseOnlineStore(OnlineStore):
         self,
         config: RepoConfig,
         table: FeatureView,
+        cluster: Cluster = None
     ):
-        return self._get_scope(config).collection(table.name)
+        return self._get_scope(
+            config,
+            cluster=cluster
+        ).collection(table.name)
 
     def _get_scope(
         self,
         config: RepoConfig,
+        cluster: Cluster = None
     ):
-        return self._get_bucket(config).scope("_default")
+        return self._get_bucket(
+            config,
+            cluster=cluster
+        ).scope("_default")
 
     def _get_bucket(
         self,
         config: RepoConfig,
-        make_if_missing: bool = False
+        make_if_missing: bool = False,
+        cluster: Cluster = None
     ):
-        return self._get_cluster(config).bucket(config.project)
+        if cluster is None:
+            cluster = self._get_cluster(config)
+        return cluster.bucket(config.project)
 
     def _get_cluster(
         self,
         config: RepoConfig,
     ):
-        cluster = Cluster(
-            self._get_db_path(config),
-            ClusterOptions(
-                authenticator=PasswordAuthenticator(
-                    config.online_store.username,
-                    config.online_store.password,
-                ),
+        if self._cluster is None:
+            self._cluster = Cluster(
+                self._get_db_path(config),
+                ClusterOptions(
+                    authenticator=PasswordAuthenticator(
+                        config.online_store.username,
+                        config.online_store.password,
+                    ),
+                )
             )
-        )
         # Wait until the cluster is ready for use.
-        cluster.wait_until_ready(timedelta(seconds=config.online_store.timeout_seconds))
-        return cluster
+        self._cluster.wait_until_ready(timedelta(seconds=config.online_store.timeout_seconds))
+        return self._cluster
 
     @log_exceptions_and_usage(online_store="couchbase")
     def online_write_batch(
@@ -137,8 +151,9 @@ class CouchbaseOnlineStore(OnlineStore):
             ).decode('ascii')
 
             timestamp = to_naive_utc(timestamp)
-            if created_ts is not None:
-                created_ts = to_naive_utc(created_ts)
+            if created_ts is None:
+                created_ts = datetime.now()
+            created_ts = to_naive_utc(created_ts)
 
             try:
                 cb_collection.insert(
@@ -189,11 +204,7 @@ class CouchbaseOnlineStore(OnlineStore):
             item is the event timestamp for the row, and the second item is a dict mapping feature names
             to values, which are returned in proto format.
         """
-
-        cb_collection = self._get_collection(config, table)
-
-        result: List[Tuple[Optional[datetime], Optional[Dict[str, ValueProto]]]] = []
-        for entity_key_bin in map(
+        entity_key_bins = list(map(
             lambda entity_key: base64.b64encode(
                 serialize_entity_key(
                     entity_key,
@@ -201,10 +212,32 @@ class CouchbaseOnlineStore(OnlineStore):
                 )
             ).decode('ascii'),
             entity_keys
-        ):
+        ))
+
+        cb_cluster = self._get_cluster(config)
+        cb_query_result = cb_cluster.query(
+            f"SELECT meta({table.name}).id as _document_id_, * from `{config.project}`._default.{table.name}"
+            f" WHERE meta({table.name}).id IN $1",
+            QueryOptions(
+                read_only=True,
+                positional_parameters=entity_key_bins
+            )
+        )
+        cb_query_result = {
+            r['_document_id_']: r[table.name]
+            for r in cb_query_result.rows()
+        }
+
+        result: List[Tuple[Optional[datetime], Optional[Dict[str, ValueProto]]]] = []
+        for entity_key_bin in entity_key_bins:
+            cb_res = cb_query_result.get(entity_key_bin, None)
+            if cb_res is None:
+                result.append((None, None))
+                continue
+
             res = {}
             res_ts = None
-            for feature_name, feature in cb_collection.get(entity_key_bin).content_as[dict].items():
+            for feature_name, feature in cb_res.items():
                 val = ValueProto()
                 val.ParseFromString(
                     base64.b64decode(
@@ -214,9 +247,6 @@ class CouchbaseOnlineStore(OnlineStore):
                 res[feature_name] = val
                 res_ts = datetime.fromisoformat(feature["event_ts"])
 
-            if not res:
-                result.append((None, None))
-            else:
                 result.append((res_ts, res))
         return result
 
@@ -244,10 +274,11 @@ class CouchbaseOnlineStore(OnlineStore):
             partial: If true, tables_to_delete and tables_to_keep are not exhaustive lists, so
                 infrastructure corresponding to other feature views should be not be touched.
         """
+        cluster = self._get_cluster(config)
         try:
             collection_manager = self._get_bucket(config).collections()
         except BucketNotFoundException:
-            self._get_cluster(config).buckets().create_bucket(
+            cluster.buckets().create_bucket(
                 CreateBucketSettings(
                     name=config.project,  # str. name of the bucket
                     flush_enabled=False,  # bool. whether flush is enabled
@@ -255,7 +286,7 @@ class CouchbaseOnlineStore(OnlineStore):
                     num_replicas=0,  # int. number of replicas
                     replica_index=False,  # bool. whether this is a replica index
                     bucket_type=BucketType.COUCHBASE,  # BucketType. type of bucket
-                    eviction_policy=EvictionPolicyType.NO_EVICTION,  # EvictionPolicyType. policy for eviction
+                    eviction_policy=EvictionPolicyType.VALUE_ONLY,  # EvictionPolicyType. policy for eviction
                     max_ttl=0,  # Union[timedelta,float,int]. **DEPRECATED** max time to live for bucket
                     max_expiry=timedelta(5),  # Union[timedelta,float,int]. max expiry time for bucket
                     compression_mode=CompressionMode.OFF,  # CompressionMode. compression mode
@@ -275,6 +306,8 @@ class CouchbaseOnlineStore(OnlineStore):
                         # "_default" # scope name
                     )
                 )
+                list(cluster.query(f"CREATE PRIMARY INDEX ON `{config.project}`"))
+                list(cluster.query(f"CREATE PRIMARY INDEX ON default:`{config.project}`._default.{table.name}"))
             except CollectionAlreadyExistsException:
                 pass
 
@@ -286,6 +319,8 @@ class CouchbaseOnlineStore(OnlineStore):
                         # "_default" # scope name
                     )
                 )
+                list(cluster.query(f"DROP PRIMARY INDEX ON `{config.project}`"))
+                list(cluster.query(f"DROP PRIMARY INDEX ON default:`{config.project}`._default.{table.name}"))
             except CollectionNotFoundException:
                 pass
 
