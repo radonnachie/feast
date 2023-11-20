@@ -139,8 +139,7 @@ class CouchbaseOnlineStore(OnlineStore):
                 to show progress.
         """
 
-        cb_collection = self._get_collection(config, table)
-
+        records = []
         for entity_key, values, timestamp, created_ts in data:
             entity_key_bin = serialize_entity_key(
                 entity_key,
@@ -155,32 +154,30 @@ class CouchbaseOnlineStore(OnlineStore):
                 created_ts = datetime.now()
             created_ts = to_naive_utc(created_ts)
 
-            try:
-                cb_collection.insert(
-                    entity_key_bin,
-                    {}
-                )
-            except DocumentExistsException:
-                pass
-
-            cb_collection.mutate_in(
+            records.append((
                 entity_key_bin,
-                [
-                    SD.upsert(
-                        feature_name,
-                        {
+                {
+                        feature_name: {
                             "value": base64.b64encode(
                                 val.SerializeToString()
                             ).decode('ascii'),
                             "event_ts": timestamp.isoformat(),
                             "created_ts": created_ts.isoformat(),
                         }
-                    )
                     for feature_name, val in values.items()
-                ]
-            )
+                }
+            ))
             if progress:
                 progress(1)
+        
+        cb_cluster = self._get_cluster(config)
+        cb_cluster.query(
+            f"UPSERT INTO `{config.project}`._default.{table.name}.inventory.landmark (KEY, VALUE)\nVALUES $1",
+            QueryOptions(
+                read_only=False,
+                positional_parameters=records
+            )
+        )
 
     @log_exceptions_and_usage(online_store="couchbase")
     def online_read(
