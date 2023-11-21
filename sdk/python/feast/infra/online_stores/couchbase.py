@@ -12,8 +12,9 @@ from couchbase.cluster import Cluster
 from couchbase.options import ClusterOptions, QueryOptions
 from couchbase.management.collections import CollectionSpec
 from couchbase.management.logic.buckets_logic import CreateBucketSettings, BucketType, EvictionPolicyType, CompressionMode, EjectionMethod, StorageBackend, ConflictResolutionType
-import couchbase.subdocument as SD
-from couchbase.exceptions import CollectionAlreadyExistsException, CollectionNotFoundException, BucketNotFoundException, DocumentExistsException
+from couchbase.management.options import GetBucketOptions
+from couchbase.management.buckets import BucketManager
+from couchbase.exceptions import CollectionAlreadyExistsException, CollectionNotFoundException, BucketNotFoundException, BucketDoesNotExistException, BucketNotFlushableException
 
 from feast import Entity
 from feast.feature_view import FeatureView
@@ -47,6 +48,15 @@ class CouchbaseOnlineStoreConfig(FeastConfigBaseModel):
 
     timeout_seconds: Optional[int] = 5
     """ (optional) connection timeout in seconds """
+
+    bucket_ram_quota_mb: Optional[int] = 1024
+    """ (optional) RAM quota when a bucket is created for a novel project """
+
+    bucket_get_timeout_s: Optional[int] = 5
+    """ (optional) timeout when getting a bucket """
+
+    bucket_expiry_max_s: Optional[int] = 0
+    """ (optional) maximum expiry time for the bucket """
 
 
 class CouchbaseOnlineStore(OnlineStore):
@@ -273,19 +283,19 @@ class CouchbaseOnlineStore(OnlineStore):
         """
         cluster = self._get_cluster(config)
         try:
-            collection_manager = self._get_bucket(config).collections()
-        except BucketNotFoundException:
+            collection_manager = self._get_bucket(config, cluster=cluster).collections()
+        except BucketDoesNotExistException:
             cluster.buckets().create_bucket(
                 CreateBucketSettings(
                     name=config.project,  # str. name of the bucket
-                    flush_enabled=False,  # bool. whether flush is enabled
-                    ram_quota_mb=1024,  # int. raw quota in megabytes
+                    flush_enabled=True,  # bool. whether flush is enabled
+                    ram_quota_mb=config.online_store.bucket_ram_quota_mb,  # int. raw quota in megabytes
                     num_replicas=0,  # int. number of replicas
                     replica_index=False,  # bool. whether this is a replica index
                     bucket_type=BucketType.COUCHBASE,  # BucketType. type of bucket
                     eviction_policy=EvictionPolicyType.VALUE_ONLY,  # EvictionPolicyType. policy for eviction
                     max_ttl=0,  # Union[timedelta,float,int]. **DEPRECATED** max time to live for bucket
-                    max_expiry=timedelta(5),  # Union[timedelta,float,int]. max expiry time for bucket
+                    max_expiry=timedelta(seconds=config.online_store.bucket_expiry_max_s),  # Union[timedelta,float,int]. max expiry time for bucket
                     compression_mode=CompressionMode.OFF,  # CompressionMode. compression mode
                     ejection_method=EjectionMethod.FULL_EVICTION,  # EjectionMethod. ejection method (deprecated, please use eviction_policy instead)
                     storage_backend=StorageBackend.COUCHSTORE,  # StorageBackend. **UNCOMMITTED** specifies the storage type to use for the bucket
@@ -293,7 +303,8 @@ class CouchbaseOnlineStore(OnlineStore):
                     conflict_resolution_type=ConflictResolutionType.TIMESTAMP,  # ConflictResolutionType
                 )
             )
-            collection_manager = self._get_bucket(config).collections()
+            # TODO need to wait or refresh or something so that the get_bucket doesn't fail
+            collection_manager = self._get_bucket(config, cluster=cluster).collections()
 
         for table in tables_to_keep:
             try:
@@ -348,5 +359,10 @@ class CouchbaseOnlineStore(OnlineStore):
             entities: Entities whose corresponding infrastructure should be deleted.
         """
         bucket_manager = self._get_cluster(config).buckets()
-        bucket_manager.flush_bucket(config.project)
+        try:
+            bucket_manager.flush_bucket(config.project)
+        except BucketNotFlushableException:
+            pass
+        except BucketDoesNotExistException:
+            return
         bucket_manager.drop_bucket(config.project)
